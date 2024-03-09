@@ -9,7 +9,10 @@ use crate::circom::reader::generate_witness_from_bin;
 use circom::circuit::{CircomCircuit, R1CS};
 use ff::Field;
 use nova_snark::{
-    traits::{circuit::TrivialTestCircuit, Group},
+    traits::{
+        circuit::TrivialCircuit, evaluation::EvaluationEngineTrait, snark::RelaxedR1CSSNARKTrait,
+        Engine, Group,
+    },
     PublicParams, RecursiveSNARK,
 };
 use num_bigint::BigInt;
@@ -24,12 +27,14 @@ use crate::circom::reader::generate_witness_from_wasm;
 use crate::circom::wasm::generate_witness_from_wasm;
 
 pub mod circom;
-
-pub type F<G> = <G as Group>::Scalar;
-pub type EE<G> = nova_snark::provider::ipa_pc::EvaluationEngine<G>;
-pub type S<G> = nova_snark::spartan::snark::RelaxedR1CSSNARK<G, EE<G>>;
-pub type C1<G> = CircomCircuit<<G as Group>::Scalar>;
-pub type C2<G> = TrivialTestCircuit<<G as Group>::Scalar>;
+pub type G<E> = <E as Engine>::GE;
+pub type F<E> = <G<E> as Group>::Scalar;
+pub type EE1<E> = nova_snark::provider::hyperkzg::EvaluationEngine<E>;
+pub type EE2<E> = nova_snark::provider::ipa_pc::EvaluationEngine<E>;
+pub type S1<E> = nova_snark::spartan::snark::RelaxedR1CSSNARK<E, EE1<E>>;
+pub type S2<E> = nova_snark::spartan::snark::RelaxedR1CSSNARK<E, EE2<E>>;
+pub type C1<E> = CircomCircuit<F<E>>;
+pub type C2<E> = TrivialCircuit<F<E>>;
 
 #[derive(Clone)]
 pub enum FileLocation {
@@ -37,18 +42,25 @@ pub enum FileLocation {
     URL(String),
 }
 
-pub fn create_public_params<G1, G2>(r1cs: R1CS<F<G1>>) -> PublicParams<G1, G2, C1<G1>, C2<G2>>
+pub fn create_public_params<E1, E2>(r1cs: R1CS<F<E1>>) -> PublicParams<E1, E2, C1<E1>, C2<E2>>
 where
-    G1: Group<Base = <G2 as Group>::Scalar>,
-    G2: Group<Base = <G1 as Group>::Scalar>,
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    EE1<E1>: EvaluationEngineTrait<E1>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
+    EE2<E2>: EvaluationEngineTrait<E2>,
 {
     let circuit_primary = CircomCircuit {
         r1cs,
         witness: None,
     };
-    let circuit_secondary = TrivialTestCircuit::default();
+    let circuit_secondary = TrivialCircuit::default();
 
-    PublicParams::setup(circuit_primary.clone(), circuit_secondary.clone())
+    PublicParams::setup(
+        &circuit_primary.clone(),
+        &circuit_secondary.clone(),
+        &*S1::<E1>::ck_floor(),
+        &*S2::<E2>::ck_floor(),
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,15 +72,15 @@ struct CircomInput {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn compute_witness<G1, G2>(
+fn compute_witness<E1, E2>(
     current_public_input: Vec<String>,
     private_input: HashMap<String, Value>,
     witness_generator_file: FileLocation,
     witness_generator_output: &Path,
-) -> Vec<<G1 as Group>::Scalar>
+) -> Vec<F<E1>>
 where
-    G1: Group<Base = <G2 as Group>::Scalar>,
-    G2: Group<Base = <G1 as Group>::Scalar>,
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
 {
     let decimal_stringified_input: Vec<String> = current_public_input
         .iter()
@@ -87,7 +99,7 @@ where
     let input_json = serde_json::to_string(&input).unwrap();
 
     if is_wasm {
-        generate_witness_from_wasm::<F<G1>>(
+        generate_witness_from_wasm::<F<E1>>(
             &witness_generator_file,
             &input_json,
             &witness_generator_output,
@@ -97,7 +109,7 @@ where
             FileLocation::PathBuf(path) => path,
             FileLocation::URL(_) => panic!("unreachable"),
         };
-        generate_witness_from_bin::<F<G1>>(
+        generate_witness_from_bin::<F<E1>>(
             &witness_generator_file,
             &input_json,
             &witness_generator_output,
@@ -132,11 +144,7 @@ where
     let input_json = serde_json::to_string(&input).unwrap();
 
     if is_wasm {
-        generate_witness_from_wasm::<F<G1>>(
-            &witness_generator_file,
-            &input_json,
-        )
-        .await
+        generate_witness_from_wasm::<F<G1>>(&witness_generator_file, &input_json).await
     } else {
         let root = current_dir().unwrap(); // compute path only when generating witness from a binary
         let witness_generator_output = root.join("circom_witness.wtns");
@@ -153,16 +161,16 @@ where
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub fn create_recursive_circuit<G1, G2>(
+pub fn create_recursive_circuit<E1, E2>(
     witness_generator_file: FileLocation,
-    r1cs: R1CS<F<G1>>,
+    r1cs: R1CS<F<E1>>,
     private_inputs: Vec<HashMap<String, Value>>,
-    start_public_input: Vec<F<G1>>,
-    pp: &PublicParams<G1, G2, C1<G1>, C2<G2>>,
-) -> Result<RecursiveSNARK<G1, G2, C1<G1>, C2<G2>>, std::io::Error>
+    start_public_input: Vec<F<E1>>,
+    pp: &PublicParams<E1, E2, C1<E1>, C2<E2>>,
+) -> Result<RecursiveSNARK<E1, E2, C1<E1>, C2<E2>>, std::io::Error>
 where
-    G1: Group<Base = <G2 as Group>::Scalar>,
-    G2: Group<Base = <G1 as Group>::Scalar>,
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
 {
     let root = current_dir().unwrap();
     let witness_generator_output = root.join("circom_witness.wtns");
@@ -175,7 +183,7 @@ where
         .collect::<Vec<String>>();
     let mut current_public_input = start_public_input_hex.clone();
 
-    let witness_0 = compute_witness::<G1, G2>(
+    let witness_0 = compute_witness::<E1, E2>(
         current_public_input.clone(),
         private_inputs[0].clone(),
         witness_generator_file.clone(),
@@ -186,19 +194,20 @@ where
         r1cs: r1cs.clone(),
         witness: Some(witness_0),
     };
-    let circuit_secondary = TrivialTestCircuit::default();
-    let z0_secondary = vec![G2::Scalar::ZERO];
+    let circuit_secondary = TrivialCircuit::default();
+    let z0_secondary = vec![E2::Scalar::ZERO];
 
-    let mut recursive_snark = RecursiveSNARK::<G1, G2, C1<G1>, C2<G2>>::new(
+    let mut recursive_snark = RecursiveSNARK::<E1, E2, C1<E1>, C2<E2>>::new(
         &pp,
         &circuit_0,
         &circuit_secondary,
-        start_public_input.clone(),
-        z0_secondary.clone(),
-    );
+        &start_public_input.clone(),
+        &z0_secondary.clone(),
+    )
+    .unwrap(); // terrible practice, but oh well...
 
     for i in 0..iteration_count {
-        let witness = compute_witness::<G1, G2>(
+        let witness = compute_witness::<E1, E2>(
             current_public_input.clone(),
             private_inputs[i].clone(),
             witness_generator_file.clone(),
@@ -220,8 +229,8 @@ where
             &pp,
             &circuit,
             &circuit_secondary,
-            start_public_input.clone(),
-            z0_secondary.clone(),
+            // start_public_input.clone(),
+            // z0_secondary.clone(),
         );
         assert!(res.is_ok());
     }
@@ -242,7 +251,6 @@ where
     G1: Group<Base = <G2 as Group>::Scalar>,
     G2: Group<Base = <G1 as Group>::Scalar>,
 {
-
     let iteration_count = private_inputs.len();
 
     let start_public_input_hex = start_public_input
@@ -262,7 +270,7 @@ where
         r1cs: r1cs.clone(),
         witness: Some(witness_0),
     };
-    let circuit_secondary = TrivialTestCircuit::default();
+    let circuit_secondary = TrivialCircuit::default();
     let z0_secondary = vec![G2::Scalar::ZERO];
 
     let mut recursive_snark = RecursiveSNARK::<G1, G2, C1<G1>, C2<G2>>::new(
@@ -306,18 +314,18 @@ where
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub fn continue_recursive_circuit<G1, G2>(
-    recursive_snark: &mut RecursiveSNARK<G1, G2, C1<G1>, C2<G2>>,
-    last_zi: Vec<F<G1>>,
+pub fn continue_recursive_circuit<E1, E2>(
+    recursive_snark: &mut RecursiveSNARK<E1, E2, C1<E1>, C2<E2>>,
+    last_zi: Vec<F<E1>>,
     witness_generator_file: FileLocation,
-    r1cs: R1CS<F<G1>>,
+    r1cs: R1CS<F<E1>>,
     private_inputs: Vec<HashMap<String, Value>>,
-    start_public_input: Vec<F<G1>>,
-    pp: &PublicParams<G1, G2, C1<G1>, C2<G2>>,
+    start_public_input: Vec<F<E1>>,
+    pp: &PublicParams<E1, E2, C1<E1>, C2<E2>>,
 ) -> Result<(), std::io::Error>
 where
-    G1: Group<Base = <G2 as Group>::Scalar>,
-    G2: Group<Base = <G1 as Group>::Scalar>,
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
 {
     let root = current_dir().unwrap();
     let witness_generator_output = root.join("circom_witness.wtns");
@@ -329,11 +337,11 @@ where
         .map(|&x| format!("{:?}", x).strip_prefix("0x").unwrap().to_string())
         .collect::<Vec<String>>();
 
-    let circuit_secondary = TrivialTestCircuit::default();
-    let z0_secondary = vec![G2::Scalar::ZERO];
+    let circuit_secondary = TrivialCircuit::default();
+    let z0_secondary = vec![E2::Scalar::ZERO];
 
     for i in 0..iteration_count {
-        let witness = compute_witness::<G1, G2>(
+        let witness = compute_witness::<E1, E2>(
             current_public_input.clone(),
             private_inputs[i].clone(),
             witness_generator_file.clone(),
@@ -355,8 +363,8 @@ where
             pp,
             &circuit,
             &circuit_secondary,
-            start_public_input.clone(),
-            z0_secondary.clone(),
+            // &start_public_input.clone(),
+            // &z0_secondary.clone(),
         );
 
         assert!(res.is_ok());
@@ -391,7 +399,7 @@ where
         .map(|&x| format!("{:?}", x).strip_prefix("0x").unwrap().to_string())
         .collect::<Vec<String>>();
 
-    let circuit_secondary = TrivialTestCircuit::default();
+    let circuit_secondary = TrivialCircuit::default();
     let z0_secondary = vec![G2::Scalar::ZERO];
 
     for i in 0..iteration_count {

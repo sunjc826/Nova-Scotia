@@ -1,10 +1,9 @@
-use bellperson::gadgets::num::AllocatedNum;
+use bellpepper_core::{num::AllocatedNum, ConstraintSystem, LinearCombination, SynthesisError};
 use nova_snark::traits::circuit::StepCircuit;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str;
 
-use bellperson::{ConstraintSystem, LinearCombination, SynthesisError};
 use ff::PrimeField;
 
 #[derive(Serialize, Deserialize)]
@@ -58,6 +57,17 @@ impl<'a, Fr: PrimeField> CircomCircuit<Fr> {
         z_out
     }
 
+    /**
+      From what I can tell, `self.witness` has the following format:
+      (1, public_outputs, public_inputs, auxiliary_inputs)
+
+      where length of public_outputs = length of public_inputs (we are doing IVC after all)
+      and self.num_inputs = length of (1, public_outputs, public_inputs)
+      and so (self.num_inputs - 1) / 2 gives length of public_outputs
+      (I think num_inputs is horribly named...)
+
+      z should be equal to public_inputs, which is checked
+    */
     pub fn vanilla_synthesize<CS: ConstraintSystem<Fr>>(
         &self,
         cs: &mut CS,
@@ -159,9 +169,5 @@ impl<'a, Fr: PrimeField> StepCircuit<Fr> for CircomCircuit<Fr> {
         let z_out = self.vanilla_synthesize(cs, z);
 
         z_out
-    }
-
-    fn output(&self, _z: &[Fr]) -> Vec<Fr> {
-        self.get_public_outputs()
     }
 }
